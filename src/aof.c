@@ -8,21 +8,22 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <zlib.h>
 
 void aofUpdateCurrentSize(void);
 
-void aof_background_fsync(int fd) {
-    bioCreateBackgroundJob(REDIS_BIO_AOF_FSYNC,(void*)(long)fd,NULL,NULL);
+void aof_background_fsync(gzFile gz) {
+    bioCreateBackgroundJob(REDIS_BIO_AOF_FSYNC,(void*)(long)gz,NULL,NULL);
 }
 
 /* Called when the user switches from "appendonly yes" to "appendonly no"
  * at runtime using the CONFIG command. */
 void stopAppendOnly(void) {
     flushAppendOnlyFile(1);
-    aof_fsync(server.appendfd);
-    close(server.appendfd);
+    gzflush(server.appendgz, Z_FULL_FLUSH);
+    gzclose(server.appendgz);
 
-    server.appendfd = -1;
+    server.appendgz = NULL;
     server.appendseldb = -1;
     server.appendonly = 0;
     /* rewrite operation in progress? kill it, wait child exit */
@@ -43,14 +44,15 @@ void stopAppendOnly(void) {
 int startAppendOnly(void) {
     server.appendonly = 1;
     server.lastfsync = time(NULL);
-    server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
-    if (server.appendfd == -1) {
+    server.appendgz = gzopen(server.appendfilename,"a+"/*O_WRONLY|O_APPEND|O_CREAT,0644*/);
+    if (server.appendgz == NULL) {
         redisLog(REDIS_WARNING,"Used tried to switch on AOF via CONFIG, but I can't open the AOF file: %s",strerror(errno));
         return REDIS_ERR;
     }
+	gzsetparams(server.appendgz, server.append_enable_gzip ? /*Z_DEFAULT_COMPRESSION*/ Z_BEST_SPEED : Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
     if (rewriteAppendOnlyFileBackground() == REDIS_ERR) {
         server.appendonly = 0;
-        close(server.appendfd);
+        gzclose(server.appendgz);
         redisLog(REDIS_WARNING,"Used tried to switch on AOF via CONFIG, I can't trigger a background AOF rewrite operation. Check the above logs for more info about the error.",strerror(errno));
         return REDIS_ERR;
     }
@@ -113,7 +115,7 @@ void flushAppendOnlyFile(int force) {
      * While this will save us against the server being killed I don't think
      * there is much to do about the whole server stopping for power problems
      * or alike */
-    nwritten = write(server.appendfd,server.aofbuf,sdslen(server.aofbuf));
+    nwritten = gzwrite(server.appendgz,server.aofbuf,sdslen(server.aofbuf));
     if (nwritten != (signed)sdslen(server.aofbuf)) {
         /* Ooops, we are in troubles. The best thing to do for now is
          * aborting instead of giving the illusion that everything is
@@ -146,11 +148,11 @@ void flushAppendOnlyFile(int force) {
     if (server.appendfsync == APPENDFSYNC_ALWAYS) {
         /* aof_fsync is defined as fdatasync() for Linux in order to avoid
          * flushing metadata. */
-        aof_fsync(server.appendfd); /* Let's try to get this data on the disk */
+        gzflush(server.appendgz, Z_FULL_FLUSH); /* Let's try to get this data on the disk */
         server.lastfsync = server.unixtime;
     } else if ((server.appendfsync == APPENDFSYNC_EVERYSEC &&
                 server.unixtime > server.lastfsync)) {
-        if (!sync_in_progress) aof_background_fsync(server.appendfd);
+        if (!sync_in_progress) aof_background_fsync(server.appendgz);
         server.lastfsync = server.unixtime;
     }
 }
@@ -282,18 +284,18 @@ void freeFakeClient(struct redisClient *c) {
  * fatal error an error message is logged and the program exists. */
 int loadAppendOnlyFile(char *filename) {
     struct redisClient *fakeClient;
-    FILE *fp = fopen(filename,"r");
+	gzFile gz = gzopen(filename,"r");
     struct redis_stat sb;
     int appendonly = server.appendonly;
     long loops = 0;
 
-    if (fp && redis_fstat(fileno(fp),&sb) != -1 && sb.st_size == 0) {
+    if (gz && redis_fstat(fileno(gz),&sb) != -1 && sb.st_size == 0) {
         server.appendonly_current_size = 0;
-        fclose(fp);
+        gzclose(gz);
         return REDIS_ERR;
     }
 
-    if (fp == NULL) {
+    if (gz == NULL) {
         redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
         exit(1);
     }
@@ -303,11 +305,11 @@ int loadAppendOnlyFile(char *filename) {
     server.appendonly = 0;
 
     fakeClient = createFakeClient();
-    startLoading(fp);
+    startLoading(gz);
 
     while(1) {
         int argc, j;
-        unsigned long len;
+		long len;
         robj **argv;
         char buf[128];
         sds argsds;
@@ -316,12 +318,12 @@ int loadAppendOnlyFile(char *filename) {
 
         /* Serve the clients from time to time */
         if (!(loops++ % 1000)) {
-            loadingProgress(ftello(fp));
+            loadingProgress(gztell(gz));
             aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
         }
 
-        if (fgets(buf,sizeof(buf),fp) == NULL) {
-            if (feof(fp))
+        if (gzgets(gz,buf,sizeof(buf)) == Z_NULL) {
+            if (gzeof(gz))
                 break;
             else
                 goto readerr;
@@ -332,13 +334,13 @@ int loadAppendOnlyFile(char *filename) {
 
         argv = zmalloc(sizeof(robj*)*argc);
         for (j = 0; j < argc; j++) {
-            if (fgets(buf,sizeof(buf),fp) == NULL) goto readerr;
+            if (gzgets(gz,buf,sizeof(buf)) == Z_NULL) goto readerr;
             if (buf[0] != '$') goto fmterr;
             len = strtol(buf+1,NULL,10);
             argsds = sdsnewlen(NULL,len);
-            if (len && fread(argsds,len,1,fp) == 0) goto fmterr;
+            if (len && gzread(gz,argsds,len) != len) goto fmterr;
             argv[j] = createObject(REDIS_STRING,argsds);
-            if (fread(buf,2,1,fp) == 0) goto fmterr; /* discard CRLF */
+            if (gzread(gz,buf,2) != 2) goto fmterr; /* discard CRLF */
         }
 
         /* Command lookup */
@@ -379,7 +381,7 @@ int loadAppendOnlyFile(char *filename) {
      * If the client is in the middle of a MULTI/EXEC, log error and quit. */
     if (fakeClient->flags & REDIS_MULTI) goto readerr;
 
-    fclose(fp);
+    gzclose(gz);
     freeFakeClient(fakeClient);
     server.appendonly = appendonly;
     stopLoading();
@@ -388,7 +390,7 @@ int loadAppendOnlyFile(char *filename) {
     return REDIS_OK;
 
 readerr:
-    if (feof(fp)) {
+    if (gzeof(gz)) {
         redisLog(REDIS_WARNING,"Unexpected end of file reading the append only file");
     } else {
         redisLog(REDIS_WARNING,"Unrecoverable error reading the append only file: %s", strerror(errno));
@@ -404,7 +406,7 @@ fmterr:
 int rewriteAppendOnlyFile(char *filename) {
     dictIterator *di = NULL;
     dictEntry *de;
-    FILE *fp;
+	gzFile gz;
     char tmpfile[256];
     int j;
     time_t now = time(NULL);
@@ -412,8 +414,8 @@ int rewriteAppendOnlyFile(char *filename) {
     /* Note that we have to use a different temp name here compared to the
      * one used by rewriteAppendOnlyFileBackground() function. */
     snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
-    fp = fopen(tmpfile,"w");
-    if (!fp) {
+    gz = gzopen(tmpfile,"w");
+    if (!gz) {
         redisLog(REDIS_WARNING, "Failed rewriting the append only file: %s", strerror(errno));
         return REDIS_ERR;
     }
@@ -425,13 +427,13 @@ int rewriteAppendOnlyFile(char *filename) {
         if (dictSize(d) == 0) continue;
         di = dictGetSafeIterator(d);
         if (!di) {
-            fclose(fp);
+            gzclose(gz);
             return REDIS_ERR;
         }
 
         /* SELECT the new DB */
-        if (fwrite(selectcmd,sizeof(selectcmd)-1,1,fp) == 0) goto werr;
-        if (fwriteBulkLongLong(fp,j) == 0) goto werr;
+        if (gzwrite(gz,selectcmd,sizeof(selectcmd)-1) != sizeof(selectcmd)-1) goto werr;
+        if (gzwriteBulkLongLong(gz,j) == 0) goto werr;
 
         /* Iterate this DB writing every entry */
         while((de = dictNext(di)) != NULL) {
@@ -439,12 +441,11 @@ int rewriteAppendOnlyFile(char *filename) {
             robj key, *o;
             time_t expiretime;
             int swapped;
-
+			
             if(server.append_fsync_after_objects){
                 objectCounter++;
-				if (objectCounter % server.append_fsync_after_objects == 0) {
-					fflush(fp);
-					aof_fsync(fileno(fp));
+                if (objectCounter % server.append_fsync_after_objects == 0) {
+                    gzflush(gz, Z_FULL_FLUSH);
 				}
             }
 
@@ -468,10 +469,10 @@ int rewriteAppendOnlyFile(char *filename) {
             if (o->type == REDIS_STRING) {
                 /* Emit a SET command */
                 char cmd[]="*3\r\n$3\r\nSET\r\n";
-                if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
+                if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
                 /* Key and value */
-                if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                if (fwriteBulkObject(fp,o) == 0) goto werr;
+                if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                if (gzwriteBulkObject(gz,o) == 0) goto werr;
             } else if (o->type == REDIS_LIST) {
                 /* Emit the RPUSHes needed to rebuild the list */
                 char cmd[]="*3\r\n$5\r\nRPUSH\r\n";
@@ -483,13 +484,13 @@ int rewriteAppendOnlyFile(char *filename) {
                     long long vlong;
 
                     while(ziplistGet(p,&vstr,&vlen,&vlong)) {
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
                         if (vstr) {
-                            if (fwriteBulkString(fp,(char*)vstr,vlen) == 0)
+                            if (gzwriteBulkString(gz,(char*)vstr,vlen) == 0)
                                 goto werr;
                         } else {
-                            if (fwriteBulkLongLong(fp,vlong) == 0)
+                            if (gzwriteBulkLongLong(gz,vlong) == 0)
                                 goto werr;
                         }
                         p = ziplistNext(zl,p);
@@ -503,9 +504,9 @@ int rewriteAppendOnlyFile(char *filename) {
                     while((ln = listNext(&li))) {
                         robj *eleobj = listNodeValue(ln);
 
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkObject(fp,eleobj) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkObject(gz,eleobj) == 0) goto werr;
                     }
                 } else {
                     redisPanic("Unknown list encoding");
@@ -518,18 +519,18 @@ int rewriteAppendOnlyFile(char *filename) {
                     int ii = 0;
                     int64_t llval;
                     while(intsetGet(o->ptr,ii++,&llval)) {
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkLongLong(fp,llval) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkLongLong(gz,llval) == 0) goto werr;
                     }
                 } else if (o->encoding == REDIS_ENCODING_HT) {
                     dictIterator *di = dictGetIterator(o->ptr);
                     dictEntry *de;
                     while((de = dictNext(di)) != NULL) {
                         robj *eleobj = dictGetEntryKey(de);
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkObject(fp,eleobj) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkObject(gz,eleobj) == 0) goto werr;
                     }
                     dictReleaseIterator(di);
                 } else {
@@ -556,14 +557,14 @@ int rewriteAppendOnlyFile(char *filename) {
                         redisAssert(ziplistGet(eptr,&vstr,&vlen,&vll));
                         score = zzlGetScore(sptr);
 
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkDouble(fp,score) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkDouble(gz,score) == 0) goto werr;
                         if (vstr != NULL) {
-                            if (fwriteBulkString(fp,(char*)vstr,vlen) == 0)
+                            if (gzwriteBulkString(gz,(char*)vstr,vlen) == 0)
                                 goto werr;
                         } else {
-                            if (fwriteBulkLongLong(fp,vll) == 0)
+                            if (gzwriteBulkLongLong(gz,vll) == 0)
                                 goto werr;
                         }
                         zzlNext(zl,&eptr,&sptr);
@@ -577,10 +578,10 @@ int rewriteAppendOnlyFile(char *filename) {
                         robj *eleobj = dictGetEntryKey(de);
                         double *score = dictGetEntryVal(de);
 
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkDouble(fp,*score) == 0) goto werr;
-                        if (fwriteBulkObject(fp,eleobj) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkDouble(gz,*score) == 0) goto werr;
+                        if (gzwriteBulkObject(gz,eleobj) == 0) goto werr;
                     }
                     dictReleaseIterator(di);
                 } else {
@@ -596,11 +597,11 @@ int rewriteAppendOnlyFile(char *filename) {
                     unsigned int flen, vlen;
 
                     while((p = zipmapNext(p,&field,&flen,&val,&vlen)) != NULL) {
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkString(fp,(char*)field,flen) == 0)
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkString(gz,(char*)field,flen) == 0)
                             goto werr;
-                        if (fwriteBulkString(fp,(char*)val,vlen) == 0)
+                        if (gzwriteBulkString(gz,(char*)val,vlen) == 0)
                             goto werr;
                     }
                 } else {
@@ -611,10 +612,10 @@ int rewriteAppendOnlyFile(char *filename) {
                         robj *field = dictGetEntryKey(de);
                         robj *val = dictGetEntryVal(de);
 
-                        if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                        if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                        if (fwriteBulkObject(fp,field) == 0) goto werr;
-                        if (fwriteBulkObject(fp,val) == 0) goto werr;
+                        if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                        if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                        if (gzwriteBulkObject(gz,field) == 0) goto werr;
+                        if (gzwriteBulkObject(gz,val) == 0) goto werr;
                     }
                     dictReleaseIterator(di);
                 }
@@ -626,9 +627,9 @@ int rewriteAppendOnlyFile(char *filename) {
                 char cmd[]="*3\r\n$8\r\nEXPIREAT\r\n";
                 /* If this key is already expired skip it */
                 if (expiretime < now) continue;
-                if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
-                if (fwriteBulkObject(fp,&key) == 0) goto werr;
-                if (fwriteBulkLongLong(fp,expiretime) == 0) goto werr;
+                if (gzwrite(gz,cmd,sizeof(cmd)-1) != sizeof(cmd)-1) goto werr;
+                if (gzwriteBulkObject(gz,&key) == 0) goto werr;
+                if (gzwriteBulkLongLong(gz,expiretime) == 0) goto werr;
             }
             if (swapped) decrRefCount(o);
         }
@@ -636,9 +637,8 @@ int rewriteAppendOnlyFile(char *filename) {
     }
 
     /* Make sure data will not remain on the OS's output buffers */
-    fflush(fp);
-    aof_fsync(fileno(fp));
-    fclose(fp);
+    gzflush(gz, Z_FULL_FLUSH);
+    gzclose(gz);
 
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
@@ -651,7 +651,7 @@ int rewriteAppendOnlyFile(char *filename) {
     return REDIS_OK;
 
 werr:
-    fclose(fp);
+    gzclose(gz);
     unlink(tmpfile);
     redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
     if (di) dictReleaseIterator(di);
@@ -740,13 +740,16 @@ void aofRemoveTempFile(pid_t childpid) {
  * to the current lenght, that is much faster. */
 void aofUpdateCurrentSize(void) {
     struct redis_stat sb;
+	int fd = open(server.appendfilename,O_RDONLY|O_NONBLOCK);
 
-    if (redis_fstat(server.appendfd,&sb) == -1) {
+    if (redis_fstat(fd,&sb) == -1) {
         redisLog(REDIS_WARNING,"Unable to check the AOF length: %s",
             strerror(errno));
     } else {
         server.appendonly_current_size = sb.st_size;
     }
+	
+	close(fd);
 }
 
 /* A background append only file rewriting (BGREWRITEAOF) terminated its work.
@@ -756,7 +759,7 @@ void backgroundRewriteDoneHandler(int statloc) {
     int bysignal = WIFSIGNALED(statloc);
 
     if (!bysignal && exitcode == 0) {
-        int newfd, oldfd;
+        gzFile newfile, oldfile;
         int nwritten;
         char tmpfile[256];
         long long now = ustime();
@@ -768,14 +771,14 @@ void backgroundRewriteDoneHandler(int statloc) {
          * rewritten AOF. */
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof",
             (int)server.bgrewritechildpid);
-        newfd = open(tmpfile,O_WRONLY|O_APPEND);
-        if (newfd == -1) {
+        newfile = gzopen(tmpfile,"a"/*O_WRONLY|O_APPEND*/);
+        if (newfile == NULL) {
             redisLog(REDIS_WARNING,
                 "Unable to open the temporary AOF produced by the child: %s", strerror(errno));
             goto cleanup;
         }
 
-        nwritten = write(newfd,server.bgrewritebuf,sdslen(server.bgrewritebuf));
+        nwritten = gzwrite(newfile,server.bgrewritebuf,sdslen(server.bgrewritebuf));
         if (nwritten != (signed)sdslen(server.bgrewritebuf)) {
             if (nwritten == -1) {
                 redisLog(REDIS_WARNING,
@@ -784,7 +787,7 @@ void backgroundRewriteDoneHandler(int statloc) {
                 redisLog(REDIS_WARNING,
                     "Short write trying to flush the parent diff to the rewritten AOF: %s", strerror(errno));
             }
-            close(newfd);
+			gzclose(newfile);
             goto cleanup;
         }
 
@@ -818,16 +821,16 @@ void backgroundRewriteDoneHandler(int statloc) {
          * guarantee atomicity for this switch has already happened by then, so
          * we don't care what the outcome or duration of that close operation
          * is, as long as the file descriptor is released again. */
-        if (server.appendfd == -1) {
+        if (server.appendgz == NULL) {
             /* AOF disabled */
 
              /* Don't care if this fails: oldfd will be -1 and we handle that.
               * One notable case of -1 return is if the old file does
               * not exist. */
-             oldfd = open(server.appendfilename,O_RDONLY|O_NONBLOCK);
+             oldfile = gzopen(server.appendfilename,"a+"/*O_RDONLY|O_NONBLOCK*/);
         } else {
             /* AOF enabled */
-            oldfd = -1; /* We'll set this to the current AOF filedes later. */
+            oldfile = NULL; /* We'll set this to the current AOF filedes later. */
         }
 
         /* Rename the temporary file. This will not unlink the target file if
@@ -835,23 +838,23 @@ void backgroundRewriteDoneHandler(int statloc) {
         if (rename(tmpfile,server.appendfilename) == -1) {
             redisLog(REDIS_WARNING,
                 "Error trying to rename the temporary AOF: %s", strerror(errno));
-            close(newfd);
-            if (oldfd != -1) close(oldfd);
+            gzclose(newfile);
+            if (oldfile != NULL) gzclose(oldfile);
             goto cleanup;
         }
 
-        if (server.appendfd == -1) {
+        if (server.appendgz == NULL) {
             /* AOF disabled, we don't need to set the AOF file descriptor
              * to this new file, so we can close it. */
-            close(newfd);
+            gzclose(newfile);
         } else {
             /* AOF enabled, replace the old fd with the new one. */
-            oldfd = server.appendfd;
-            server.appendfd = newfd;
+            oldfile = server.appendgz;
+            server.appendgz = newfile;
             if (server.appendfsync == APPENDFSYNC_ALWAYS)
-                aof_fsync(newfd);
+                gzflush(newfile, Z_FULL_FLUSH);
             else if (server.appendfsync == APPENDFSYNC_EVERYSEC)
-                aof_background_fsync(newfd);
+                aof_background_fsync(newfile);
             server.appendseldb = -1; /* Make sure SELECT is re-issued */
             aofUpdateCurrentSize();
             server.auto_aofrewrite_base_size = server.appendonly_current_size;
@@ -865,7 +868,7 @@ void backgroundRewriteDoneHandler(int statloc) {
         redisLog(REDIS_NOTICE, "Background AOF rewrite successful");
 
         /* Asynchronously close the overwritten AOF. */
-        if (oldfd != -1) bioCreateBackgroundJob(REDIS_BIO_CLOSE_FILE,(void*)(long)oldfd,NULL,NULL);
+        if (oldfile != NULL) bioCreateBackgroundJob(REDIS_BIO_CLOSE_FILE,(void*)(long)oldfile,NULL,NULL);
 
         redisLog(REDIS_VERBOSE,
             "Background AOF rewrite signal handler took %lldus", ustime()-now);

@@ -829,7 +829,7 @@ void initServerConfig() {
     server.auto_aofrewrite_base_size = 0;
     server.aofrewrite_scheduled = 0;
     server.lastfsync = time(NULL);
-    server.appendfd = -1;
+    server.appendgz = NULL;
     server.appendseldb = -1; /* Make sure the first time will not match */
     server.aof_flush_postponed_start = 0;
     server.pidfile = zstrdup("/var/run/redis.pid");
@@ -983,8 +983,9 @@ void initServer() {
         acceptUnixHandler,NULL) == AE_ERR) oom("creating file event");
 
     if (server.appendonly) {
-        server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
-        if (server.appendfd == -1) {
+        server.appendgz = gzopen(server.appendfilename,"a+"/*O_WRONLY|O_APPEND|O_CREAT,0644*/);
+		gzsetparams(server.appendgz, server.append_enable_gzip ? Z_DEFAULT_COMPRESSION : Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
+        if (server.appendgz == NULL) {
             redisLog(REDIS_WARNING, "Can't open the append-only file: %s",
                 strerror(errno));
             exit(1);
@@ -1176,7 +1177,7 @@ int prepareForShutdown() {
         }
         /* Append only file: fsync() the AOF and exit */
         redisLog(REDIS_NOTICE,"Calling fsync() on the AOF file.");
-        aof_fsync(server.appendfd);
+        gzflush(server.appendgz, Z_FULL_FLUSH);
     }
     if (server.saveparamslen > 0) {
         redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");

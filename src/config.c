@@ -449,6 +449,11 @@ void configSetCommand(redisClient *c) {
                 }
             }
         }
+    } else if (!strcasecmp(c->argv[2]->ptr,"append-enable-gzip")) {
+        int yn = yesnotoi(o->ptr);
+
+        if (yn == -1) goto badfmt;
+        server.append_enable_gzip = yn;
     } else if (!strcasecmp(c->argv[2]->ptr,"auto-aof-rewrite-percentage")) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
         server.auto_aofrewrite_perc = ll;

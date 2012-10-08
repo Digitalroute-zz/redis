@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <syslog.h>
+#include <zlib.h>
 
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
@@ -435,8 +436,9 @@ struct redisServer {
     int daemonize;
     int appendonly;
     int appendfsync;
+	int append_enable_gzip;
     int no_appendfsync_on_rewrite;
-    long append_fsync_after_objects;
+	int append_fsync_after_objects;
     int auto_aofrewrite_perc;       /* Rewrite AOF if % growth is > M and... */
     off_t auto_aofrewrite_min_size; /* the AOF file is at least N bytes. */
     off_t auto_aofrewrite_base_size;/* AOF size on latest startup or rewrite. */
@@ -444,7 +446,7 @@ struct redisServer {
     int aofrewrite_scheduled;       /* Rewrite once BGSAVE terminates. */
     int shutdown_asap;
     time_t lastfsync;
-    int appendfd;
+    gzFile appendgz;
     int appendseldb;
     time_t aof_flush_postponed_start;
     char *pidfile;
@@ -804,6 +806,10 @@ int fwriteBulkString(FILE *fp, char *s, unsigned long len);
 int fwriteBulkDouble(FILE *fp, double d);
 int fwriteBulkLongLong(FILE *fp, long long l);
 int fwriteBulkObject(FILE *fp, robj *obj);
+int gzwriteBulkString(gzFile gz, char *s, unsigned long len);
+int gzwriteBulkDouble(gzFile gz, double d);
+int gzwriteBulkLongLong(gzFile gz, long long l);
+int gzwriteBulkObject(gzFile gz, robj *obj);
 
 /* Replication */
 void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
